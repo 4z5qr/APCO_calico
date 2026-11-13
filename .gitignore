@@ -1,0 +1,10 @@
+build/
+*.o
+*.so
+*.a
+spectrum.csv
+candidates.csv
+*.iq
+*.cfile
+*.wav
+.DS_Store
