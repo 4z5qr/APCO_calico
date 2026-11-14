@@ -5,6 +5,11 @@
 #include <QDoubleSpinBox>
 #include <QFile>
 #include <QFileDialog>
+#include <QDir>
+#include <QLineEdit>
+#include <QImage>
+#include <QStatusBar>
+#include <chrono>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -74,7 +79,7 @@ protected:
       std::vector<std::complex<float>> iq(N);
       const auto started=std::chrono::steady_clock::now();
       int scanIndex=0;
-      const int steps=std::max(1,int(std::ceil((cfg.stopMHz-cfg.startMHz)/cfg.stepMHz)));
+      const int steps=std::max(1,1+int(std::ceil((cfg.stopMHz-cfg.startMHz-cfg.rateMHz)/cfg.stepMHz)));
       QDir().mkpath(cfg.directory);
       while(!stopping) {
         if(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-started).count()>=cfg.scanSeconds) break;
@@ -117,10 +122,10 @@ protected:
         std::vector<float> sorted(snap.spectrum.begin(),snap.spectrum.end());
         std::nth_element(sorted.begin(),sorted.begin()+N/2,sorted.end());
         const double noise=sorted[N/2];
-        int peak=N/2;
+        int peak=-1;
         for(int k=128;k<N-128;k++){
           if(std::abs(k-N/2)<16) continue;
-          if(snap.spectrum[k]>snap.spectrum[peak] || peak==N/2) peak=k;
+          if(peak<0 || snap.spectrum[k]>snap.spectrum[peak]) peak=k;
         }
         snap.peakMHz=center+(peak-N/2)*cfg.rateMHz/N;
         snap.peakDb=snap.spectrum[peak]-noise;
@@ -175,7 +180,7 @@ public:
   void accept(const Snapshot &s){
     center=s.centerMHz;rate=s.rateMHz;current=s.spectrum;
     if(!overview && !current.isEmpty()){
-      waterfall.scroll(0,1,waterfall.rect());
+      { QImage old=waterfall.copy(); QPainter painter(&waterfall); painter.drawImage(0,1,old,0,0,old.width(),old.height()-1); }
       for(int x=0;x<waterfall.width();x++){
         int i=x*current.size()/waterfall.width();
         waterfall.setPixelColor(x,0,heat(current[i]));
@@ -264,11 +269,8 @@ public:
     });
     connect(run,&QPushButton::clicked,this,[this]{
       if(worker) return;
-      if(start->value()>=stop->value() || rate->value()>stop->value()-start->value()+rate->value() ||
-         step->value()>rate->value()*.9) {
-        if(start->value()>=stop->value() || step->value()>rate->value()*.9){
-          QMessageBox::warning(this,"Invalid scan","Start must be below stop; step should be <= 90% of sample rate.");return;
-        }
+      if(start->value()>=stop->value() || step->value()>rate->value()*.9 || rate->value()>stop->value()-start->value()) {
+        QMessageBox::warning(this,"Invalid scan","Start must be below stop, scan span >= sample rate, and step <= 90% of sample rate.");return;
       }
       Config c;
       c.startMHz=start->value();c.stopMHz=stop->value();c.stepMHz=step->value();
