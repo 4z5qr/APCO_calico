@@ -33,3 +33,27 @@ Produces `spectrum.csv` (all FFT bins) and `candidates.csv` (regions above a loc
 - A single 5 MHz capture may lose usable spectrum at the edges; sweep with overlap.
 - The center DC artifact is masked by 8 bins.
 - Candidate extraction may split a modulated P25 channel into multiple regions. Next: channel-width-aware grouping, occupancy persistence, P25 sync validation.
+
+## Experimental Qt GUI
+
+Install Qt development dependencies:
+
+```bash
+sudo apt install -y qtbase5-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/p25scanner_gui
+```
+
+The GUI provides start/stop frequencies, tuning step, sample rate, gain,
+dwell time, total scan time, IQ capture duration, and a trigger menu.
+
+**Current limitations:**
+- SNR-proxy peak threshold triggers raw wideband CF32 IQ recordings.
+- C4FM and CQPSK trigger choices are placeholders and intentionally do not
+  record until channelization, symbol recovery and a classifier exist.
+- The overview currently shows the most recent tuning window, not yet a
+  persisted accumulated full-band history.
+- The waterfall updates once per dwell, not continuously at FFT frame rate.
+- The implementation is experimental and has not yet been validated with
+  a physical LimeSDR-USB.
