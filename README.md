@@ -57,3 +57,18 @@ dwell time, total scan time, IQ capture duration, and a trigger menu.
 - The waterfall updates once per dwell, not continuously at FFT frame rate.
 - The implementation is experimental and has not yet been validated with
   a physical LimeSDR-USB.
+
+## CSV regression output (GUI)
+
+Each GUI scan creates `results/<UTC_timestamp>_<id>/` containing:
+- `config.csv`: parameter/value pairs for reproducibility
+- `session.csv`: one session summary row (start/end/status/counts)
+- `events.csv`: timestamped session, capture and error events
+- `observations.csv`: one row per completed tuning dwell, including non-triggering dwells
+- `candidates.csv`: SNR-proxy threshold hits (not protocol-confirmed channels)
+- `captures.csv`: raw IQ recording metadata (frequency, rate, CF32, sample count, bytes)
+- `captures/*.cf32`: binary interleaved complex float32 IQ; this cannot be CSV without impractical size/precision cost
+
+All metadata and logs are UTF-8 CSV with headers and CSV-escaped text. Time stamps use UTC ISO 8601. The raw IQ payload is intentionally binary. Upload a zipped run directory to compare regressions.
+
+Limitations: no automated pass/fail baseline, no per-channel occupancy intervals yet, no P25 modulation classification, and no complete FFT-bin CSV export from the GUI. The logged peak excess is a *relative noise-floor proxy*, not calibrated RF SNR.
