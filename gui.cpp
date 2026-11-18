@@ -9,6 +9,10 @@
 #include <QLineEdit>
 #include <QImage>
 #include <QStatusBar>
+#include <QTextStream>
+#include <QFileInfo>
+#include <QSysInfo>
+#include <QUuid>
 #include <chrono>
 #include <QFormLayout>
 #include <QGroupBox>
@@ -38,6 +42,7 @@ struct Config {
   int dwellMs=1000, scanSeconds=600, captureSeconds=3;
   QString device="driver=lime", directory="captures";
   int trigger=0; // 0 SNR, 1 C4FM candidate, 2 CQPSK candidate
+  QString resultsDirectory="results";
 };
 Q_DECLARE_METATYPE(Config)
 
@@ -59,6 +64,59 @@ signals:
   void log(QString);
 protected:
   void run() override {
+    const QString runId=QDateTime::currentDateTimeUtc().toString("yyyyMMdd_HHmmss_zzz")+"_"+
+      QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
+    const QString runDir=cfg.resultsDirectory+"/"+runId;
+    QDir().mkpath(runDir+"/captures");
+    QFile eventsFile(runDir+"/events.csv"), observationsFile(runDir+"/observations.csv"),
+          candidatesFile(runDir+"/candidates.csv"), capturesFile(runDir+"/captures.csv"),
+          configFile(runDir+"/config.csv"), sessionFile(runDir+"/session.csv");
+    const auto openCsv=[](QFile &f,const QString &header){
+      if(!f.open(QIODevice::WriteOnly|QIODevice::Text)) throw std::runtime_error(("Cannot open "+f.fileName()).toStdString());
+      f.write(header.toUtf8()); f.write("\n"); f.flush();
+    };
+    auto writeRow=[](QFile &f,const QStringList &fields){
+      QStringList encoded;
+      for(QString field:fields) {
+        field.replace('"', "\"\"");
+        if(field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r'))
+          field="\"" + field + "\"";
+        encoded << field;
+      }
+      f.write(encoded.join(',').toUtf8()); f.write("\n"); f.flush();
+    };
+    const QString startedUtc=QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    QString outcome="error";
+    int observationsCount=0, capturesCount=0, triggerCount=0;
+    try {
+      openCsv(eventsFile,"timestamp_utc,event,frequency_hz,details");
+      openCsv(observationsFile,"timestamp_utc,center_frequency_hz,sample_rate_hz,dwell_ms,fft_frames,peak_frequency_hz,peak_excess_db,noise_floor_relative_db,triggered,modulation,coverage");
+      openCsv(candidatesFile,"timestamp_utc,frequency_hz,peak_excess_db,trigger,classification");
+      openCsv(capturesFile,"timestamp_utc,path,center_frequency_hz,sample_rate_hz,format,samples,bytes,trigger,peak_excess_db");
+      openCsv(configFile,"parameter,value");
+      openCsv(sessionFile,"run_id,started_utc,ended_utc,status,observations,captures,triggers,device");
+      for(const auto &pair:QVector<QPair<QString,QString>>{
+        {"start_mhz",QString::number(cfg.startMHz,'f',6)},
+        {"stop_mhz",QString::number(cfg.stopMHz,'f',6)},
+        {"step_mhz",QString::number(cfg.stepMHz,'f',6)},
+        {"sample_rate_msps",QString::number(cfg.rateMHz,'f',6)},
+        {"gain_db",QString::number(cfg.gain)},
+        {"snr_proxy_threshold_db",QString::number(cfg.thresholdDb)},
+        {"dwell_ms",QString::number(cfg.dwellMs)},
+        {"scan_seconds",QString::number(cfg.scanSeconds)},
+        {"capture_seconds",QString::number(cfg.captureSeconds)},
+        {"trigger_mode",QString::number(cfg.trigger)},
+        {"device",cfg.device},
+        {"iq_format","CF32 interleaved little-endian host"},
+        {"fft_size","8192"},
+        {"results_directory",runDir}
+      }) writeRow(configFile,{pair.first,pair.second});
+      writeRow(eventsFile,{startedUtc,"session_start","",runId});
+      emit log("Results: "+runDir);
+    } catch(const std::exception &e) {
+      emit log(QString("Logging setup ERROR: ")+e.what());
+      return;
+    }
     SoapySDR::Device *dev=nullptr;
     SoapySDR::Stream *stream=nullptr;
     fftwf_complex *in=nullptr,*out=nullptr;
@@ -133,31 +191,78 @@ protected:
         // cannot establish C4FM/CQPSK without channelization and symbol recovery.
         snap.modulation="unknown";
         snap.triggered=cfg.trigger==0 && snap.peakDb>=cfg.thresholdDb;
+        const QString observedUtc=QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+        ++observationsCount;
+        if(snap.triggered) {
+          ++triggerCount;
+          writeRow(candidatesFile,{observedUtc,QString::number(snap.peakMHz*1e6,'f',0),
+            QString::number(snap.peakDb,'f',3),"snr_proxy","unknown"});
+        }
+        writeRow(observationsFile,{observedUtc,QString::number(center*1e6,'f',0),
+          QString::number(rate,'f',0),QString::number(cfg.dwellMs),
+          QString::number(frames),QString::number(snap.peakMHz*1e6,'f',0),
+          QString::number(snap.peakDb,'f',3),QString::number(noise,'f',3),
+          snap.triggered?"1":"0",snap.modulation,"observed"});
         if(snap.triggered && !last.empty()) {
-          const QString name=cfg.directory+"/iq_"+QDateTime::currentDateTimeUtc().toString("yyyyMMdd_HHmmss_zzz")+
+          const QString name=runDir+"/captures/iq_"+QDateTime::currentDateTimeUtc().toString("yyyyMMdd_HHmmss_zzz")+
             "_"+QString::number(center,'f',4)+"MHz.cf32";
           QFile file(name);
           if(file.open(QIODevice::WriteOnly)) {
             // Capture from the current tuned center; duration configurable.
             emit log("Trigger SNR "+QString::number(snap.peakDb,'f',1)+" dB: "+name);
+            writeRow(eventsFile,{observedUtc,"capture_started",QString::number(center*1e6,'f',0),name});
+            qint64 samplesWritten=0;
             const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(cfg.captureSeconds);
             while(!stopping && std::chrono::steady_clock::now()<until) {
               int flags=0; long long ns=0;
               void *buff[]={iq.data()};
               int n=dev->readStream(stream,buff,N,flags,ns,100000);
-              if(n>0) file.write(reinterpret_cast<const char*>(iq.data()),n*sizeof(iq[0]));
-              if(n<0) break;
+              if(n>0) {
+                qint64 bytes=file.write(reinterpret_cast<const char*>(iq.data()),n*sizeof(iq[0]));
+                if(bytes<0 || bytes!=qint64(n*sizeof(iq[0]))) {
+                  writeRow(eventsFile,{QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs),
+                    "capture_write_error",QString::number(center*1e6,'f',0),file.errorString()});
+                  break;
+                }
+                samplesWritten+=n;
+              }
+              if(n<0) {
+                writeRow(eventsFile,{QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs),
+                  "capture_read_error",QString::number(center*1e6,'f',0),QString::number(n)});
+                break;
+              }
             }
-          } else emit log("Cannot write "+name);
+            file.flush();file.close();
+            ++capturesCount;
+            writeRow(capturesFile,{observedUtc,name,QString::number(center*1e6,'f',0),
+              QString::number(rate,'f',0),"cf32",QString::number(samplesWritten),
+              QString::number(samplesWritten*qint64(sizeof(iq[0]))),"snr_proxy",
+              QString::number(snap.peakDb,'f',3)});
+            writeRow(eventsFile,{QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs),
+              "capture_finished",QString::number(center*1e6,'f',0),QString::number(samplesWritten)});
+          } else {
+            emit log("Cannot write "+name);
+            writeRow(eventsFile,{observedUtc,"capture_open_error",QString::number(center*1e6,'f',0),file.errorString()});
+          }
         }
         emit snapshot(snap);
       }
-    } catch(const std::exception &e) {emit log(QString("ERROR: ")+e.what());}
+      outcome=stopping?"stopped":"completed";
+    } catch(const std::exception &e) {
+      emit log(QString("ERROR: ")+e.what());
+      writeRow(eventsFile,{QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs),
+        "error","",QString::fromUtf8(e.what())});
+    }
     if(dev && stream){try{dev->deactivateStream(stream);}catch(...){} dev->closeStream(stream);}
     if(plan) fftwf_destroy_plan(plan);
     if(in) fftwf_free(in); if(out) fftwf_free(out);
     if(dev) SoapySDR::Device::unmake(dev);
-    emit log("Scanner stopped");
+    writeRow(eventsFile,{QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs),
+      "session_end","",outcome});
+    writeRow(sessionFile,{runId,startedUtc,QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs),
+      outcome,QString::number(observationsCount),QString::number(capturesCount),
+      QString::number(triggerCount),cfg.device});
+    emit log("Scanner stopped; CSV: "+runDir);
   }
 };
 
@@ -245,7 +350,7 @@ public:
     mode->addItem("SNR threshold — operational");
     mode->addItem("C4FM — not implemented");
     mode->addItem("CQPSK — not implemented");
-    device=new QLineEdit("driver=lime");directory=new QLineEdit("captures");
+    device=new QLineEdit("driver=lime");directory=new QLineEdit("results");
     form->addRow("Start frequency (MHz)",start);form->addRow("Stop frequency (MHz)",stop);
     form->addRow("Step (MHz)",step);form->addRow("Sample rate (MS/s)",rate);
     form->addRow("RF gain (dB)",gain);form->addRow("Trigger",mode);
@@ -253,7 +358,7 @@ public:
     form->addRow("Dwell per tuning (ms)",dwell);
     form->addRow("Total scan time (s)",duration);
     form->addRow("IQ capture duration (s)",capture);
-    form->addRow("SoapySDR device",device);form->addRow("Capture folder",directory);
+    form->addRow("SoapySDR device",device);form->addRow("Results folder (CSV + IQ)",directory);
     layout->addWidget(settings);
     auto *buttons=new QHBoxLayout;
     run=new QPushButton("Start scan");halt=new QPushButton("Stop");halt->setEnabled(false);
@@ -276,7 +381,7 @@ public:
       c.startMHz=start->value();c.stopMHz=stop->value();c.stepMHz=step->value();
       c.rateMHz=rate->value();c.gain=gain->value();c.thresholdDb=snr->value();
       c.dwellMs=dwell->value();c.scanSeconds=duration->value();c.captureSeconds=capture->value();
-      c.trigger=mode->currentIndex();c.device=device->text();c.directory=directory->text();
+      c.trigger=mode->currentIndex();c.device=device->text();c.resultsDirectory=directory->text();
       top->start=c.startMHz;top->stop=c.stopMHz;
       worker=new Scanner;worker->cfg=c;
       connect(worker,&Scanner::snapshot,this,[this](const Snapshot &s){
